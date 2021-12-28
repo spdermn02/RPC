@@ -32,6 +32,8 @@ class RPCClient extends EventEmitter {
     this.options = options;
 
     this.accessToken = null;
+    this.refreshToken = null;
+    this.expiresIn = null;
     this.clientId = null;
 
     /**
@@ -133,16 +135,16 @@ class RPCClient extends EventEmitter {
    * @returns {Promise<RPCClient>}
    */
   async login(options = {}) {
-    let { clientId, accessToken } = options;
+    let { clientId, accessToken, refreshToken } = options;
     await this.connect(clientId);
     if (!options.scopes) {
       this.emit('ready');
       return this;
     }
     if (!accessToken) {
-      accessToken = await this.authorize(options);
+      [accessToken, refreshToken] = await this.authorize(options);
     }
-    return this.authenticate(accessToken);
+    return this.authenticate(accessToken, refreshToken, options.clientSecret);
   }
 
   /**
@@ -222,16 +224,33 @@ class RPCClient extends EventEmitter {
       }),
     });
 
-    return response.access_token;
+    return [response.access_token, response.refresh_token];
+  }
+
+  async reauthorize({ clientSecret, refreshToken } = {}) {
+    if (refreshToken === undefined) {
+      const e = new Error('refreshToken not present');
+      throw e;
+    }
+    const response = await this.fetch('POST', '/oauth2/token', {
+      data: new URLSearchParams({
+        client_id: this.clientId,
+        client_secret: clientSecret,
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+      }),
+    });
+    return [response.access_token, response.refresh_token];
   }
 
   /**
    * Authenticate
    * @param {string} accessToken access token
+   * @param {string} refreshToken refresh token
    * @returns {Promise}
    * @private
    */
-  authenticate(accessToken) {
+  authenticate(accessToken, refreshToken) {
     return this.request('AUTHENTICATE', { access_token: accessToken })
       .then(({ application, user }) => {
         this.accessToken = accessToken;
@@ -239,6 +258,10 @@ class RPCClient extends EventEmitter {
         this.user = user;
         this.emit('ready');
         return this;
+      }, () => {
+        if (refreshToken !== undefined) {
+          this.reauthorize(this.clientSecret, refreshToken);
+        }
       });
   }
 
