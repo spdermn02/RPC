@@ -52,7 +52,7 @@ class RPCClient extends EventEmitter {
     }
 
     this.fetch = (method, path, { data, query } = {}) =>
-      fetch(`${this.fetch.endpoint}${path}${query ? new URLSearchParams(query) : ''}`, {
+      fetch(`${this.fetch.endpoint}${path}${query ? `?${new URLSearchParams(query)}` : ''}`, {
         method,
         body: data,
         headers: {
@@ -167,17 +167,21 @@ class RPCClient extends EventEmitter {
    * @private
    */
   _onRpcMessage(message) {
+    if (!message || typeof message !== 'object') {
+      return;
+    }
     if (message.cmd === RPCCommands.DISPATCH && message.evt === RPCEvents.READY) {
-      if (message.data.user) {
+      if (message.data && message.data.user) {
         this.user = message.data.user;
       }
       this.emit('connected');
     } else if (this._expecting.has(message.nonce)) {
       const { resolve, reject } = this._expecting.get(message.nonce);
       if (message.evt === 'ERROR') {
-        const e = new Error(message.data.message);
-        e.code = message.data.code;
-        e.data = message.data;
+        const errData = message.data || {};
+        const e = new Error(errData.message || 'RPC error');
+        e.code = errData.code;
+        e.data = errData;
         reject(e);
       } else {
         resolve(message.data);

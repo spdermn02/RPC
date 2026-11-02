@@ -2,7 +2,6 @@
 
 const net = require('net');
 const EventEmitter = require('events');
-const fetch = require('node-fetch');
 const { uuid } = require('../util');
 
 const OPCodes = {
@@ -40,22 +39,6 @@ function getIPC(id = 0) {
   });
 }
 
-async function findEndpoint(tries = 0) {
-  if (tries > 30) {
-    throw new Error('Could not find endpoint');
-  }
-  const endpoint = `http://127.0.0.1:${6463 + (tries % 10)}`;
-  try {
-    const r = await fetch(endpoint);
-    if (r.status === 404) {
-      return endpoint;
-    }
-    return findEndpoint(tries + 1);
-  } catch (e) {
-    return findEndpoint(tries + 1);
-  }
-}
-
 function encode(op, data) {
   data = JSON.stringify(data);
   const len = Buffer.byteLength(data);
@@ -66,37 +49,39 @@ function encode(op, data) {
   return packet;
 }
 
-const working = {
-  full: '',
-  op: undefined,
-};
+// Frames from Discord are only trusted to be well formed, not to be small. Anything larger
+// than this is treated as a corrupt stream and the connection is dropped.
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 
-function decode(socket, callback) {
-  const packet = socket.read();
-  if (!packet) {
-    return;
-  }
-
-  let { op } = working;
-  let raw;
-  if (working.full === '') {
-    op = working.op = packet.readInt32LE(0);
-    const len = packet.readInt32LE(4);
-    raw = packet.slice(8, len + 8);
-  } else {
-    raw = packet.toString();
-  }
-
-  try {
-    const data = JSON.parse(working.full + raw);
+/**
+ * Pull every complete frame out of `state.buffer`. Partial frames stay buffered until the rest
+ * arrives, and several frames in one read are all delivered. State lives on the transport, not
+ * the module, so two clients can never splice each other's frames together.
+ * Returns false when the stream is unrecoverable.
+ */
+function decode(state, chunk, callback) {
+  state.buffer = state.buffer.length ? Buffer.concat([state.buffer, chunk]) : chunk;
+  while (state.buffer.length >= 8) {
+    const op = state.buffer.readInt32LE(0);
+    const len = state.buffer.readInt32LE(4);
+    if (len < 0 || len > MAX_FRAME_BYTES) {
+      state.buffer = Buffer.alloc(0);
+      return false;
+    }
+    if (state.buffer.length < 8 + len) {
+      break;
+    }
+    const raw = state.buffer.subarray(8, 8 + len).toString();
+    state.buffer = state.buffer.subarray(8 + len);
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (err) {
+      continue;
+    }
     callback({ op, data }); // eslint-disable-line callback-return
-    working.full = '';
-    working.op = undefined;
-  } catch (err) {
-    working.full += raw;
   }
-
-  decode(socket, callback);
+  return true;
 }
 
 class IPCTransport extends EventEmitter {
@@ -104,6 +89,7 @@ class IPCTransport extends EventEmitter {
     super();
     this.client = client;
     this.socket = null;
+    this.decodeState = { buffer: Buffer.alloc(0) };
   }
 
   async connect() {
@@ -117,33 +103,31 @@ class IPCTransport extends EventEmitter {
     }));
     socket.pause();
     socket.on('readable', () => {
-      decode(socket, ({ op, data }) => {
-        switch (op) {
-          case OPCodes.PING:
-            this.send(data, OPCodes.PONG);
-            break;
-          case OPCodes.FRAME:
-            if (!data) {
-              return;
-            }
-            if (data.cmd === 'AUTHORIZE' && data.evt !== 'ERROR') {
-              findEndpoint()
-                .then((endpoint) => {
-                  this.client.request.endpoint = endpoint;
-                })
-                .catch((e) => {
-                  this.client.emit('error', e);
-                });
-            }
-            this.emit('message', data);
-            break;
-          case OPCodes.CLOSE:
-            this.emit('close', data);
-            break;
-          default:
-            break;
+      let chunk;
+      while ((chunk = socket.read()) !== null) {
+        const ok = decode(this.decodeState, chunk, ({ op, data }) => {
+          switch (op) {
+            case OPCodes.PING:
+              this.send(data, OPCodes.PONG);
+              break;
+            case OPCodes.FRAME:
+              if (!data) {
+                return;
+              }
+              this.emit('message', data);
+              break;
+            case OPCodes.CLOSE:
+              this.emit('close', data);
+              break;
+            default:
+              break;
+          }
+        });
+        if (!ok) {
+          socket.destroy();
+          return;
         }
-      });
+      }
     });
   }
 
@@ -152,10 +136,19 @@ class IPCTransport extends EventEmitter {
   }
 
   send(data, op = OPCodes.FRAME) {
+    if (!this.socket || this.socket.destroyed || !this.socket.writable) {
+      return false;
+    }
     this.socket.write(encode(op, data));
+    return true;
   }
 
   async close() {
+    // Never connected, or already gone: there is nothing to close, and waiting for a
+    // 'close' event that will never come would leave the caller hanging forever.
+    if (!this.socket || this.socket.destroyed) {
+      return undefined;
+    }
     return new Promise((r) => {
       this.once('close', r);
       this.send({}, OPCodes.CLOSE);
